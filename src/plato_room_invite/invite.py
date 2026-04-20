@@ -1,140 +1,135 @@
-"""Room invite — token-based invites with expiration, usage limits, and claim tracking."""
+"""Room invites — token generation with expiry, usage limits, roles, batch creation, revocation."""
 import time
 import hashlib
 import secrets
 from dataclasses import dataclass, field
 from typing import Optional
-from enum import Enum
 from collections import defaultdict
-
-class InviteRole(Enum):
-    GUEST = "guest"
-    MEMBER = "member"
-    MODERATOR = "moderator"
+from enum import Enum
 
 class InviteStatus(Enum):
     PENDING = "pending"
     CLAIMED = "claimed"
     EXPIRED = "expired"
     REVOKED = "revoked"
-    MAX_USES = "max_uses"
 
 @dataclass
-class InviteToken:
-    code: str
+class RoomInvite:
+    token: str
     room: str
-    creator: str
-    role: InviteRole = InviteRole.MEMBER
+    created_by: str = ""
+    role: str = "member"
     max_uses: int = 1
     uses: int = 0
-    claimed_by: list[str] = field(default_factory=list)
+    expires_at: float = 0.0
     status: InviteStatus = InviteStatus.PENDING
     created_at: float = field(default_factory=time.time)
-    expires_at: float = 0.0
+    claimed_by: list[str] = field(default_factory=list)
     note: str = ""
+    metadata: dict = field(default_factory=dict)
 
-class RoomInvite:
-    def __init__(self):
-        self._tokens: dict[str, InviteToken] = {}
-        self._room_invites: dict[str, list[str]] = defaultdict(list)  # room -> [token_codes]
+class RoomInviteSystem:
+    def __init__(self, token_length: int = 16, max_invites_per_room: int = 100):
+        self.token_length = token_length
+        self.max_invites_per_room = max_invites_per_room
+        self._invites: dict[str, RoomInvite] = {}  # token → invite
+        self._by_room: dict[str, list[str]] = defaultdict(list)  # room → [tokens]
+        self._by_agent: dict[str, list[str]] = defaultdict(list)  # agent → [tokens created]
         self._claim_log: list[dict] = []
 
-    def create(self, room: str, creator: str, role: str = "member",
-               max_uses: int = 1, duration: float = 86400 * 7,
-               note: str = "") -> InviteToken:
-        code = secrets.token_urlsafe(8).lower()
-        token = InviteToken(code=code, room=room, creator=creator,
-                          role=InviteRole(role), max_uses=max_uses,
-                          expires_at=time.time() + duration if duration > 0 else 0.0,
-                          note=note)
-        self._tokens[code] = token
-        self._room_invites[room].append(code)
-        return token
+    def create(self, room: str, created_by: str = "", role: str = "member",
+              max_uses: int = 1, expires_hours: float = 24.0, note: str = "") -> RoomInvite:
+        if len(self._by_room[room]) >= self.max_invites_per_room:
+            self._revoke_oldest(room)
+        token = secrets.token_urlsafe(self.token_length)
+        expires_at = time.time() + (expires_hours * 3600) if expires_hours > 0 else 0.0
+        invite = RoomInvite(token=token, room=room, created_by=created_by, role=role,
+                           max_uses=max_uses, expires_at=expires_at, note=note)
+        self._invites[token] = invite
+        self._by_room[room].append(token)
+        self._by_agent[created_by].append(token)
+        return invite
 
-    def create_bulk(self, room: str, creator: str, count: int = 5, **kwargs) -> list[InviteToken]:
-        return [self.create(room, creator, **kwargs) for _ in range(count)]
+    def create_batch(self, room: str, count: int, created_by: str = "",
+                    role: str = "member", expires_hours: float = 24.0) -> list[RoomInvite]:
+        return [self.create(room, created_by, role, 1, expires_hours,
+                           f"Batch invite #{i+1}") for i in range(count)]
 
-    def claim(self, code: str, claimant: str) -> dict:
-        token = self._tokens.get(code)
-        if not token:
-            return {"error": "Invalid invite code"}
-        if token.status == InviteStatus.REVOKED:
-            return {"error": "Invite revoked"}
-        if token.status == InviteStatus.EXPIRED:
-            return {"error": "Invite expired"}
-        if token.status == InviteStatus.MAX_USES:
-            return {"error": "Invite max uses reached"}
-        if token.expires_at > 0 and time.time() > token.expires_at:
-            token.status = InviteStatus.EXPIRED
-            return {"error": "Invite expired"}
-        if claimant in token.claimed_by:
-            return {"error": "Already claimed"}
-        if token.uses >= token.max_uses:
-            token.status = InviteStatus.MAX_USES
-            return {"error": "Invite max uses reached"}
+    def claim(self, token: str, agent_id: str) -> Optional[RoomInvite]:
+        invite = self._invites.get(token)
+        if not invite:
+            return None
+        if invite.status == InviteStatus.REVOKED:
+            return None
+        if invite.status == InviteStatus.EXPIRED:
+            return None
+        if invite.expires_at > 0 and invite.expires_at < time.time():
+            invite.status = InviteStatus.EXPIRED
+            return None
+        if invite.uses >= invite.max_uses:
+            return None
+        invite.uses += 1
+        invite.claimed_by.append(agent_id)
+        if invite.uses >= invite.max_uses:
+            invite.status = InviteStatus.CLAIMED
+        self._claim_log.append({"token": token, "agent": agent_id, "room": invite.room,
+                               "role": invite.role, "timestamp": time.time()})
+        return invite
 
-        token.uses += 1
-        token.claimed_by.append(claimant)
-        if token.uses >= token.max_uses:
-            token.status = InviteStatus.CLAIMED
-
-        entry = {"code": code, "room": token.room, "claimant": claimant,
-                "role": token.role.value, "timestamp": time.time()}
-        self._claim_log.append(entry)
-        if len(self._claim_log) > 2000:
-            self._claim_log = self._claim_log[-2000:]
-
-        return {"success": True, "room": token.room, "role": token.role.value,
-                "code": code, "remaining_uses": token.max_uses - token.uses}
-
-    def revoke(self, code: str) -> bool:
-        token = self._tokens.get(code)
-        if token and token.status == InviteStatus.PENDING:
-            token.status = InviteStatus.REVOKED
+    def revoke(self, token: str) -> bool:
+        invite = self._invites.get(token)
+        if invite and invite.status == InviteStatus.PENDING:
+            invite.status = InviteStatus.REVOKED
             return True
         return False
 
-    def get(self, code: str) -> Optional[InviteToken]:
-        return self._tokens.get(code)
+    def revoke_all(self, room: str, created_by: str = "") -> int:
+        count = 0
+        for token in self._by_room.get(room, []):
+            invite = self._invites.get(token)
+            if invite and invite.status == InviteStatus.PENDING:
+                if not created_by or invite.created_by == created_by:
+                    invite.status = InviteStatus.REVOKED
+                    count += 1
+        return count
 
-    def room_invites(self, room: str, active_only: bool = True) -> list[InviteToken]:
-        codes = self._room_invites.get(room, [])
-        tokens = [self._tokens[c] for c in codes if c in self._tokens]
-        if active_only:
-            tokens = [t for t in tokens if t.status == InviteStatus.PENDING]
-        return sorted(tokens, key=lambda t: t.created_at, reverse=True)
+    def _revoke_oldest(self, room: str):
+        tokens = self._by_room.get(room, [])
+        if not tokens:
+            return
+        oldest = min(tokens, key=lambda t: self._invites[t].created_at)
+        self.revoke(oldest)
 
-    def expire_old(self) -> int:
+    def get(self, token: str) -> Optional[RoomInvite]:
+        return self._invites.get(token)
+
+    def room_invites(self, room: str) -> list[RoomInvite]:
+        tokens = self._by_room.get(room, [])
+        return [self._invites[t] for t in tokens if t in self._invites]
+
+    def agent_invites(self, agent_id: str) -> list[RoomInvite]:
+        tokens = self._by_agent.get(agent_id, [])
+        return [self._invites[t] for t in tokens if t in self._invites]
+
+    def purge_expired(self) -> int:
         now = time.time()
-        expired = 0
-        for token in self._tokens.values():
-            if token.status == InviteStatus.PENDING and token.expires_at > 0 and now > token.expires_at:
-                token.status = InviteStatus.EXPIRED
-                expired += 1
-        return expired
+        purged = 0
+        for invite in self._invites.values():
+            if invite.expires_at > 0 and invite.expires_at < now and invite.status == InviteStatus.PENDING:
+                invite.status = InviteStatus.EXPIRED
+                purged += 1
+        return purged
 
     def claim_history(self, room: str = "", limit: int = 50) -> list[dict]:
-        entries = self._claim_log
+        log = self._claim_log
         if room:
-            entries = [e for e in entries if e.get("room") == room]
-        return list(reversed(entries))[:limit]
-
-    def creator_invites(self, creator: str) -> list[InviteToken]:
-        return [t for t in self._tokens.values() if t.creator == creator]
-
-    def room_members(self, room: str) -> list[str]:
-        codes = self._room_invites.get(room, [])
-        members = set()
-        for code in codes:
-            token = self._tokens.get(code)
-            if token:
-                members.update(token.claimed_by)
-        return list(members)
+            log = [e for e in log if e["room"] == room]
+        return log[-limit:]
 
     @property
     def stats(self) -> dict:
-        statuses = {}
-        for t in self._tokens.values():
-            statuses[t.status.value] = statuses.get(t.status.value, 0) + 1
-        return {"total_tokens": len(self._tokens), "rooms": len(self._room_invites),
-                "total_claims": len(self._claim_log), "by_status": statuses}
+        total = len(self._invites)
+        pending = sum(1 for i in self._invites.values() if i.status == InviteStatus.PENDING)
+        claimed = sum(1 for i in self._invites.values() if i.status == InviteStatus.CLAIMED)
+        return {"total": total, "pending": pending, "claimed": claimed,
+                "rooms": len(self._by_room), "claims": len(self._claim_log)}
